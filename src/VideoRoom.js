@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import io from "socket.io-client";
 
-const socket = io("http://localhost:5000");
+const socket = io("https://meet-backend-ntnb.onrender.com");
 
 function VideoRoom({ roomId, userName }) {
   const localVideoRef = useRef(null);
@@ -26,7 +26,7 @@ function VideoRoom({ roomId, userName }) {
           const file = new File([blob], `${roomId}-${Date.now()}.webm`);
           const formData = new FormData();
           formData.append("file", file);
-          await fetch("http://localhost:5000/upload-recording", { method: "POST", body: formData });
+          await fetch("https://meet-backend-ntnb.onrender.com/upload-recording", { method: "POST", body: formData });
         } catch (error) {
           console.error("Error uploading recording:", error);
         }
