@@ -4,12 +4,18 @@ export default function RecordingHistory() {
   const [recordings, setRecordings] = useState([]);
 
   const fetchRecordings = async () => {
-    const res = await fetch("http://localhost:5000/recordings");
-    const data = await res.json();
-    setRecordings(data);
+    try {
+      const res = await fetch("http://localhost:5000/recordings");
+      const data = await res.json();
+      setRecordings(data);
+    } catch (error) {
+      console.error("Error fetching recordings:", error);
+    }
   };
 
-  useEffect(() => fetchRecordings(), []);
+  useEffect(() => {
+    fetchRecordings();
+  }, []);
 
   return (
     <div>
