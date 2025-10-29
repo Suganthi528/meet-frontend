@@ -3,8 +3,6 @@ import io from "socket.io-client";
 import { v4 as uuidv4 } from "uuid";
 import "./VideoRoom.css";
 
-const socket = io("http://127.0.0.1"); // your backend
-
 function VideoRoom() {
   const [roomId, setRoomId] = useState("");
   const [userName, setUserName] = useState("");
@@ -21,6 +19,7 @@ function VideoRoom() {
   const [quality, setQuality] = useState("HD");
 
   const localVideoRef = useRef(null);
+  const socketRef = useRef(null);
   const peersRef = useRef({});
   const mediaRecorderRef = useRef(null);
   const recordedChunksRef = useRef([]);
@@ -68,7 +67,7 @@ function VideoRoom() {
 
     peer.onicecandidate = (event) => {
       if (event.candidate)
-        socket.emit("signal", { to: userToSignal, from: callerID, signal: event.candidate });
+        socketRef.current?.emit("signal", { to: userToSignal, from: callerID, signal: event.candidate });
     };
 
     if (initiator) {
@@ -76,7 +75,7 @@ function VideoRoom() {
         try {
           const offer = await peer.createOffer();
           await peer.setLocalDescription(offer);
-          socket.emit("signal", { to: userToSignal, from: callerID, signal: peer.localDescription });
+          socketRef.current?.emit("signal", { to: userToSignal, from: callerID, signal: peer.localDescription });
         } catch (error) {
           console.error("Negotiation error:", error);
         }
@@ -89,10 +88,32 @@ function VideoRoom() {
   useEffect(() => {
     if (!joined) return;
 
+    // Create socket using the page hostname so the client connects to the
+    // correct host (handles both localhost and 127.0.0.1) and ensures port 5000
+    const host = typeof window !== "undefined" ? window.location.hostname : "127.0.0.1";
+    const socketUrl = `http://${host}:5000`;
+    const socket = io(socketUrl, {
+      transports: ["websocket", "polling"],
+      path: "/socket.io",
+    });
+    // Keep reference so other handlers outside this effect can use the socket
+    socketRef.current = socket;
+
+    // When socket connects, emit join-room so we don't race with UI handlers
+    socket.on("connect", () => {
+      try {
+        if (roomId && userName) {
+          socket.emit("join-room", roomId, userName);
+        }
+      } catch (err) {
+        console.error("Error emitting join-room on connect:", err);
+      }
+    });
+
     const handleAllUsers = (users) => {
       users.forEach((userId) => {
         if (!peersRef.current[userId]) {
-          const peer = createPeer(userId, socket.id, localStream, true);
+          const peer = createPeer(userId, socketRef.current?.id, localStream, true);
           peersRef.current[userId] = peer;
         }
       });
@@ -100,7 +121,7 @@ function VideoRoom() {
 
     const handleUserJoined = (userId) => {
       if (!peersRef.current[userId]) {
-        const peer = createPeer(userId, socket.id, localStream, true);
+        const peer = createPeer(userId, socketRef.current?.id, localStream, true);
         peersRef.current[userId] = peer;
       }
     };
@@ -117,7 +138,7 @@ function VideoRoom() {
     const handleSignal = async ({ from, signal }) => {
       let peer = peersRef.current[from];
       if (!peer) {
-        peer = createPeer(from, socket.id, localStream, false);
+        peer = createPeer(from, socketRef.current?.id, localStream, false);
         peersRef.current[from] = peer;
       }
       try {
@@ -125,11 +146,11 @@ function VideoRoom() {
           await peer.setRemoteDescription(new RTCSessionDescription(signal));
           const answer = await peer.createAnswer();
           await peer.setLocalDescription(answer);
-          socket.emit("signal", { to: from, from: socket.id, signal: peer.localDescription });
+            socketRef.current?.emit("signal", { to: from, from: socketRef.current?.id, signal: peer.localDescription });
         } else if (signal.type === "answer") {
           await peer.setRemoteDescription(new RTCSessionDescription(signal));
         } else if (signal.candidate) {
-          await peer.addIceCandidate(new RTCIceCandidate(signal));
+            await peer.addIceCandidate(new RTCIceCandidate(signal));
         }
       } catch (error) {
         console.error("Signal error:", error);
@@ -147,11 +168,16 @@ function VideoRoom() {
     socket.on("participant-list", handleParticipantList);
 
     return () => {
-      socket.off("all-users");
-      socket.off("user-joined");
-      socket.off("user-left");
-      socket.off("signal");
-      socket.off("participant-list");
+      socket.off("all-users", handleAllUsers);
+      socket.off("user-joined", handleUserJoined);
+      socket.off("user-left", handleUserLeft);
+      socket.off("signal", handleSignal);
+      socket.off("participant-list", handleParticipantList);
+      try {
+        socket.disconnect();
+      } catch (err) {
+        console.error("Error disconnecting socket:", err);
+      }
     };
   }, [joined, localStream]);
 
@@ -204,7 +230,7 @@ function VideoRoom() {
     peersRef.current = {};
     setJoined(false);
     setRemoteStreams([]);
-    socket.emit("leave-room", roomId);
+    socketRef.current?.emit("leave-room", roomId);
   };
 
   // 🗑 Delete handlers
@@ -245,7 +271,6 @@ function VideoRoom() {
               setRoomId(newRoom);
               await startMedia();
               setJoined(true);
-              socket.emit("join-room", newRoom, userName);
             }}
           >
             ➕ Create Room
@@ -256,7 +281,6 @@ function VideoRoom() {
               if (!userName || !roomId) return alert("Enter name & Room ID");
               await startMedia();
               setJoined(true);
-              socket.emit("join-room", roomId, userName);
             }}
           >
             🔗 Join Room
