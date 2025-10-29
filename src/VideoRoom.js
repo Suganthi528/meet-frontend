@@ -1,101 +1,125 @@
 import React, { useEffect, useRef, useState } from "react";
 import io from "socket.io-client";
+import { v4 as uuidv4 } from "uuid";
+import "./VideoRoom.css";
 
-const socket = io("https://meet-backend-ntnb.onrender.com");
+const socket = io("http://127.0.0.1"); // your backend
 
-function VideoRoom({ roomId, userName }) {
+function VideoRoom() {
+  const [roomId, setRoomId] = useState("");
+  const [userName, setUserName] = useState("");
+  const [joined, setJoined] = useState(false);
+  const [localStream, setLocalStream] = useState(null);
+  const [remoteStreams, setRemoteStreams] = useState([]);
+  const [participants, setParticipants] = useState([]);
+  const [micOn, setMicOn] = useState(true);
+  const [cameraOn, setCameraOn] = useState(true);
+  const [isSharing, setIsSharing] = useState(false);
+  const [recordedVideoURL, setRecordedVideoURL] = useState(null);
+  const [meetingHistory, setMeetingHistory] = useState([]);
+  const [recordingHistory, setRecordingHistory] = useState([]);
+  const [quality, setQuality] = useState("HD");
+
   const localVideoRef = useRef(null);
-  const remoteVideosRef = useRef({});
   const peersRef = useRef({});
   const mediaRecorderRef = useRef(null);
   const recordedChunksRef = useRef([]);
-  const [captions, setCaptions] = useState([]);
-  const [remoteStreams, setRemoteStreams] = useState([]);
 
-  // Recording
-  const startRecording = (stream) => {
-    try {
-      const mediaRecorder = new MediaRecorder(stream);
-      recordedChunksRef.current = [];
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data.size > 0) recordedChunksRef.current.push(e.data);
-      };
-      mediaRecorder.onstop = async () => {
-        try {
-          const blob = new Blob(recordedChunksRef.current, { type: "video/webm" });
-          const file = new File([blob], `${roomId}-${Date.now()}.webm`);
-          const formData = new FormData();
-          formData.append("file", file);
-          await fetch("https://meet-backend-ntnb.onrender.com/upload-recording", { method: "POST", body: formData });
-        } catch (error) {
-          console.error("Error uploading recording:", error);
-        }
-      };
-      mediaRecorder.start();
-      mediaRecorderRef.current = mediaRecorder;
-    } catch (error) {
-      console.error("Error starting recording:", error);
-    }
-  };
-
-  const stopRecording = () => mediaRecorderRef.current?.stop();
-
-  // WebRTC
+  // ✅ Load meeting & recording history on page load
   useEffect(() => {
-    let localStream = null;
-    let recognition = null;
-    let mounted = true;
+    const savedMeetings = JSON.parse(localStorage.getItem("meetingHistory")) || [];
+    const savedRecordings = JSON.parse(localStorage.getItem("recordingHistory")) || [];
+    setMeetingHistory(savedMeetings);
+    setRecordingHistory(savedRecordings);
+  }, []);
 
-    const createPeer = (otherUser, callerID, stream, initiator = true) => {
-      const peer = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
-      stream.getTracks().forEach(track => peer.addTrack(track, stream));
+  useEffect(() => {
+    if (localVideoRef.current && localStream) {
+      localVideoRef.current.srcObject = localStream;
+    }
+  }, [localStream]);
 
-      peer.ontrack = (event) => {
-        if (mounted) {
-          setRemoteStreams(prev => {
-            if (!prev.find(s => s.id === event.streams[0].id)) return [...prev, event.streams[0]];
-            return prev;
-          });
-        }
-      };
+  // ✅ update meeting & recording history to localStorage whenever changed
+  useEffect(() => {
+    localStorage.setItem("meetingHistory", JSON.stringify(meetingHistory));
+  }, [meetingHistory]);
 
-      peer.onicecandidate = (event) => {
-        if (event.candidate) {
-          socket.emit("signal", { to: otherUser, from: callerID, signal: event.candidate });
-        }
-      };
+  useEffect(() => {
+    localStorage.setItem("recordingHistory", JSON.stringify(recordingHistory));
+  }, [recordingHistory]);
 
-      if (initiator) {
-        peer.onnegotiationneeded = async () => {
-          try {
-            const offer = await peer.createOffer();
-            await peer.setLocalDescription(offer);
-            socket.emit("signal", { to: otherUser, from: callerID, signal: peer.localDescription });
-          } catch (error) {
-            console.error("Error creating offer:", error);
-          }
-        };
-      }
-      return peer;
+  const createPeer = (userToSignal, callerID, stream, initiator = true) => {
+    const peer = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    });
+
+    if (stream) {
+      stream.getTracks().forEach((track) => peer.addTrack(track, stream));
+    }
+
+    peer.ontrack = (event) => {
+      const incomingStream = event.streams[0];
+      setRemoteStreams((prev) =>
+        !prev.find((s) => s.id === incomingStream.id)
+          ? [...prev, incomingStream]
+          : prev
+      );
     };
 
-    const handleUserJoined = (id) => {
-      if (localStream && mounted) {
-        const peer = createPeer(id, socket.id, localStream, true);
-        peersRef.current[id] = peer;
+    peer.onicecandidate = (event) => {
+      if (event.candidate)
+        socket.emit("signal", { to: userToSignal, from: callerID, signal: event.candidate });
+    };
+
+    if (initiator) {
+      peer.onnegotiationneeded = async () => {
+        try {
+          const offer = await peer.createOffer();
+          await peer.setLocalDescription(offer);
+          socket.emit("signal", { to: userToSignal, from: callerID, signal: peer.localDescription });
+        } catch (error) {
+          console.error("Negotiation error:", error);
+        }
+      };
+    }
+
+    return peer;
+  };
+
+  useEffect(() => {
+    if (!joined) return;
+
+    const handleAllUsers = (users) => {
+      users.forEach((userId) => {
+        if (!peersRef.current[userId]) {
+          const peer = createPeer(userId, socket.id, localStream, true);
+          peersRef.current[userId] = peer;
+        }
+      });
+    };
+
+    const handleUserJoined = (userId) => {
+      if (!peersRef.current[userId]) {
+        const peer = createPeer(userId, socket.id, localStream, true);
+        peersRef.current[userId] = peer;
+      }
+    };
+
+    const handleUserLeft = (userId) => {
+      setRemoteStreams((prev) => prev.filter((s) => s.id !== userId));
+      const peer = peersRef.current[userId];
+      if (peer) {
+        peer.close();
+        delete peersRef.current[userId];
       }
     };
 
     const handleSignal = async ({ from, signal }) => {
-      if (!localStream || !mounted) return;
-
       let peer = peersRef.current[from];
       if (!peer) {
-        const newPeer = createPeer(from, socket.id, localStream, false);
-        peersRef.current[from] = newPeer;
-        peer = newPeer;
+        peer = createPeer(from, socket.id, localStream, false);
+        peersRef.current[from] = peer;
       }
-
       try {
         if (signal.type === "offer") {
           await peer.setRemoteDescription(new RTCSessionDescription(signal));
@@ -108,127 +132,222 @@ function VideoRoom({ roomId, userName }) {
           await peer.addIceCandidate(new RTCIceCandidate(signal));
         }
       } catch (error) {
-        console.error("Error handling signal:", error);
+        console.error("Signal error:", error);
       }
     };
 
-    navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-      .then((stream) => {
-        if (!mounted) {
-          stream.getTracks().forEach(track => track.stop());
-          return;
-        }
+    const handleParticipantList = (list) => {
+      setParticipants(list);
+    };
 
-        localStream = stream;
-        
-        // Check if ref is still mounted before accessing
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = stream;
-        }
-        
-        startRecording(stream);
-        
-        // Start captions with reference tracking
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        if (SpeechRecognition) {
-          recognition = new SpeechRecognition();
-          recognition.lang = "en-US";
-          recognition.continuous = true;
-          recognition.interimResults = true;
-          recognition.onresult = (e) => {
-            if (mounted) {
-              const text = Array.from(e.results).map(r => r[0].transcript).join(" ");
-              setCaptions([text]);
-            }
-          };
-          try {
-            recognition.start();
-          } catch (error) {
-            console.error("Error starting speech recognition:", error);
-          }
-        }
+    socket.on("all-users", handleAllUsers);
+    socket.on("user-joined", handleUserJoined);
+    socket.on("user-left", handleUserLeft);
+    socket.on("signal", handleSignal);
+    socket.on("participant-list", handleParticipantList);
 
-        socket.emit("join-room", roomId, userName);
-        socket.on("user-joined", handleUserJoined);
-        socket.on("signal", handleSignal);
-      })
-      .catch((error) => {
-        console.error("Error accessing media devices:", error);
-      });
-
-    // Proper cleanup function
     return () => {
-      mounted = false;
-
-      // Stop recording
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-        try {
-          mediaRecorderRef.current.stop();
-        } catch (error) {
-          console.error("Error stopping recording:", error);
-        }
-      }
-      
-      // Stop speech recognition
-      if (recognition) {
-        try {
-          recognition.stop();
-        } catch (error) {
-          console.error("Error stopping recognition:", error);
-        }
-      }
-      
-      // Stop all tracks in local stream
-      if (localStream) {
-        localStream.getTracks().forEach(track => {
-          try {
-            track.stop();
-          } catch (error) {
-            console.error("Error stopping track:", error);
-          }
-        });
-      }
-      
-      // Close all peer connections
-      Object.values(peersRef.current).forEach(peer => {
-        if (peer && typeof peer.close === 'function') {
-          try {
-            peer.close();
-          } catch (error) {
-            console.error("Error closing peer:", error);
-          }
-        }
-      });
-      peersRef.current = {};
-      
-      // Remove socket listeners
-      socket.off("user-joined", handleUserJoined);
-      socket.off("signal", handleSignal);
+      socket.off("all-users");
+      socket.off("user-joined");
+      socket.off("user-left");
+      socket.off("signal");
+      socket.off("participant-list");
     };
-  }, [roomId, userName]);
+  }, [joined, localStream]);
+
+  const startMedia = async () => {
+    try {
+      const constraints = {
+        video: { width: quality === "HD" ? 1280 : 640, height: quality === "HD" ? 720 : 360 },
+        audio: true,
+      };
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      setLocalStream(stream);
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
+      startRecording(stream);
+    } catch (error) {
+      alert("Camera/Mic not accessible");
+      console.error(error);
+    }
+  };
+
+  const startRecording = (stream) => {
+    recordedChunksRef.current = [];
+    const mediaRecorder = new MediaRecorder(stream);
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) recordedChunksRef.current.push(e.data);
+    };
+    mediaRecorder.onstop = () => {
+      const blob = new Blob(recordedChunksRef.current, { type: "video/webm" });
+      const url = URL.createObjectURL(blob);
+      setRecordedVideoURL(url);
+      const newRec = { url, roomId, userName, date: new Date().toLocaleString() };
+      setRecordingHistory((prev) => [newRec, ...prev]);
+    };
+    mediaRecorder.start();
+    mediaRecorderRef.current = mediaRecorder;
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive")
+      mediaRecorderRef.current.stop();
+  };
+
+  const handleLeave = () => {
+    stopRecording();
+    const newMeeting = { roomId, userName, date: new Date().toLocaleString() };
+    setMeetingHistory((prev) => [newMeeting, ...prev]);
+    if (localStream) localStream.getTracks().forEach((t) => t.stop());
+    Object.values(peersRef.current).forEach((p) => p.close());
+    peersRef.current = {};
+    setJoined(false);
+    setRemoteStreams([]);
+    socket.emit("leave-room", roomId);
+  };
+
+  // 🗑 Delete handlers
+  const deleteMeeting = (index) => {
+    const updated = meetingHistory.filter((_, i) => i !== index);
+    setMeetingHistory(updated);
+    localStorage.setItem("meetingHistory", JSON.stringify(updated));
+  };
+
+  const deleteRecording = (index) => {
+    const updated = recordingHistory.filter((_, i) => i !== index);
+    setRecordingHistory(updated);
+    localStorage.setItem("recordingHistory", JSON.stringify(updated));
+  };
+
+  // ---------------- UI -----------------
+  if (!joined) {
+    return (
+      <div className="join-container">
+        <h1 className="title">🎥 Cartoon Meet</h1>
+        <input
+          placeholder="Enter your name"
+          value={userName}
+          onChange={(e) => setUserName(e.target.value)}
+          className="input-box"
+        />
+        <input
+          placeholder="Enter Room ID (or create one)"
+          value={roomId}
+          onChange={(e) => setRoomId(e.target.value)}
+          className="input-box"
+        />
+        <div className="button-group">
+          <button
+            className="btn create"
+            onClick={async () => {
+              const newRoom = uuidv4();
+              setRoomId(newRoom);
+              await startMedia();
+              setJoined(true);
+              socket.emit("join-room", newRoom, userName);
+            }}
+          >
+            ➕ Create Room
+          </button>
+          <button
+            className="btn join"
+            onClick={async () => {
+              if (!userName || !roomId) return alert("Enter name & Room ID");
+              await startMedia();
+              setJoined(true);
+              socket.emit("join-room", roomId, userName);
+            }}
+          >
+            🔗 Join Room
+          </button>
+        </div>
+
+        <div className="history-section">
+          {meetingHistory.length > 0 && (
+            <div className="history-box">
+              <h3>📜 Meeting History</h3>
+              <ul>
+                {meetingHistory.map((m, i) => (
+                  <li key={i}>
+                    {m.roomId} - {m.userName} ({m.date}){" "}
+                    <button onClick={() => deleteMeeting(i)}>🗑</button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {recordingHistory.length > 0 && (
+            <div className="history-box">
+              <h3>🎬 Recording History</h3>
+              <ul>
+                {recordingHistory.map((r, i) => (
+                  <li key={i}>
+                    <a href={r.url} target="_blank" rel="noreferrer">
+                      Video
+                    </a>{" "}
+                    ({r.date}){" "}
+                    <button onClick={() => deleteRecording(i)}>🗑</button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div style={{ textAlign: "center" }}>
+    <div className="meeting-container">
       <h2>Meeting ID: {roomId}</h2>
-      <video ref={localVideoRef} autoPlay playsInline muted width="300" />
-      <div>
-        {remoteStreams.map((stream, idx) => (
-          <video
-            key={idx}
-            ref={(el) => {
-              if (el) {
-                remoteVideosRef.current[stream.id] = el;
-                el.srcObject = stream;
-              }
-            }}
-            autoPlay
-            playsInline
-            width="300"
-          />
+      <div className="video-grid">
+        <video ref={localVideoRef} autoPlay muted playsInline width="300" />
+        {remoteStreams.map((s, i) => (
+          <video key={i} ref={(el) => el && (el.srcObject = s)} autoPlay playsInline width="300" />
         ))}
       </div>
-      <div style={{ background: "black", color: "white", marginTop: "10px", padding: "10px" }}>
-        <strong>Captions:</strong> {captions.join(" ")}
+
+      <div className="controls">
+        <button onClick={handleLeave}>🚪 Leave</button>
+      </div>
+
+      <div className="side-panel">
+        <div className="participant-list">
+          <h3>👥 Participants</h3>
+          <ul>
+            {participants.map((p) => (
+              <li key={p.id}>{p.name}</li>
+            ))}
+          </ul>
+        </div>
+
+        <div className="history-box">
+          <h3>📜 Meeting History</h3>
+          <ul>
+            {meetingHistory.map((m, i) => (
+              <li key={i}>
+                {m.roomId} - {m.userName} ({m.date}){" "}
+                <button onClick={() => deleteMeeting(i)}>🗑</button>
+              </li>
+            ))}
+          </ul>
+        </div>
+
+        <div className="history-box">
+          <h3>🎬 Recording History</h3>
+          <ul>
+            {recordingHistory.map((r, i) => (
+              <li key={i}>
+                <a href={r.url} target="_blank" rel="noreferrer">
+                  Video
+                </a>{" "}
+                ({r.date}){" "}
+                <button onClick={() => deleteRecording(i)}>🗑</button>
+              </li>
+            ))}
+          </ul>
+        </div>
       </div>
     </div>
   );
